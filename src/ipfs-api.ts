@@ -45,11 +45,24 @@ export async function ipfsDagPut(
     const url = dagPutUrl(apiUrl, pin);
     const body = dagJsonEncode(data);
 
+    // Kubo's dag/put API requires multipart form data.
+    // Construct a minimal multipart body since httpFetch only supports string bodies.
+    const boundary = "ad4m-ipfs-boundary";
+    const multipartBody = [
+        `--${boundary}\r\n`,
+        `Content-Disposition: form-data; name="file"; filename="data"\r\n`,
+        `Content-Type: application/json\r\n`,
+        `\r\n`,
+        body,
+        `\r\n`,
+        `--${boundary}--\r\n`,
+    ].join("");
+
     const response = await getTransport().fetch(
         url,
         "POST",
-        { "Content-Type": "application/json" },
-        body,
+        { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+        multipartBody,
     );
 
     if (response.status < 200 || response.status >= 300) {
