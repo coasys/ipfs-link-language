@@ -29,6 +29,14 @@ import { createCommit, getHeadCid } from "./src/perspective-dag.js";
 import { syncFromIPNS, fullSync } from "./src/sync.js";
 import { ipnsPublish } from "./src/ipfs-api.js";
 import { pinCid } from "./src/pinning.js";
+import {
+    publishPresence,
+    queryOnlineAgents,
+    sendSignal as pubsubSendSignal,
+    sendBroadcast as pubsubSendBroadcast,
+    registerSignalCallback as pubsubRegisterSignalCallback,
+    clearSignalCallback,
+} from "./src/pubsub.js";
 
 // Adapter imports (interfaces for singletons, Deno impls for init)
 import { initTransport } from "./src/transport.js";
@@ -58,6 +66,9 @@ const PINNING_SERVICE_URL = "<to-be-filled>";
 
 //!@ad4m-template-variable
 const NEIGHBOURHOOD_META = "<to-be-filled>";
+
+//!@ad4m-template-variable
+const NEIGHBOURHOOD_URL = "<to-be-filled>";
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -107,6 +118,7 @@ const language = defineLanguage({
     },
 
     async teardown() {
+        clearSignalCallback();
         myDid = "";
         console.log("[ipfs-link-language] teardown");
     },
@@ -260,6 +272,49 @@ const language = defineLanguage({
             return store.listPeers("peers/");
         },
     },
+
+    // -----------------------------------------------------------------------
+    // telepresence
+    // -----------------------------------------------------------------------
+    telepresence: {
+        async setOnlineStatus(status: unknown): Promise<void> {
+            if (NEIGHBOURHOOD_URL === "<to-be-filled>") {
+                console.log("[ipfs-link-language] telepresence: no neighbourhood URL configured");
+                return;
+            }
+            await publishPresence(IPFS_API_URL, NEIGHBOURHOOD_URL, myDid, status);
+        },
+
+        async getOnlineAgents(): Promise<unknown[]> {
+            if (NEIGHBOURHOOD_URL === "<to-be-filled>") {
+                return [];
+            }
+            const records = await queryOnlineAgents(IPFS_API_URL, NEIGHBOURHOOD_URL);
+            return records;
+        },
+
+        async sendSignal(remoteDid: string, payload: unknown): Promise<object> {
+            if (NEIGHBOURHOOD_URL === "<to-be-filled>") {
+                return { status: "error", message: "no neighbourhood URL configured" };
+            }
+            return await pubsubSendSignal(
+                IPFS_API_URL, NEIGHBOURHOOD_URL, myDid, remoteDid, payload,
+            );
+        },
+
+        async sendBroadcast(payload: unknown): Promise<object> {
+            if (NEIGHBOURHOOD_URL === "<to-be-filled>") {
+                return { status: "error", message: "no neighbourhood URL configured" };
+            }
+            return await pubsubSendBroadcast(
+                IPFS_API_URL, NEIGHBOURHOOD_URL, myDid, payload,
+            );
+        },
+
+        async registerSignalCallback(callback: any): Promise<void> {
+            pubsubRegisterSignalCallback(callback);
+        },
+    },
 });
 
 // ---------------------------------------------------------------------------
@@ -281,6 +336,11 @@ export const {
     perspectiveQueryRun,
     peersSetLocal,
     peersRemote,
+    telepresenceSetOnlineStatus,
+    telepresenceGetOnlineAgents,
+    telepresenceSendSignal,
+    telepresenceSendBroadcast,
+    telepresenceRegisterSignalCallback,
 } = language;
 
 export default language;
