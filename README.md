@@ -9,6 +9,7 @@ AD4M link language that syncs Perspective triples to IPFS via the Kubo HTTP API,
 - **Query:** indexed local store (source, target, predicate)
 - **Content-addressed:** every link is a CID-addressable DAG-JSON object
 - **Merkle DAG:** perspective diffs form a hash-linked chain for verifiable history
+- **Telepresence:** real-time presence and signalling via Kubo PubSub (multibase-encoded topics for v0.41+ compatibility)
 
 ## Template Variables
 
@@ -35,7 +36,7 @@ Requires `@coasys/ad4m-ldk` at `../ad4m/ad4m-ldk/js/` or set `AD4M_LDK_ENTRY`.
 node --experimental-vm-modules --import tsx --test tests/*.test.ts
 ```
 
-238 tests across 10 suites.
+294 tests across 11 suites.
 
 ## Architecture
 
@@ -50,6 +51,7 @@ Same [pure/impure pattern](https://github.com/HexaField/ad4m-link-language-templ
 - `src/dual-language.ts` — dual-language support
 - `src/sdna.ts` — social DNA definitions
 - `src/settings.ts` — language settings
+- `src/pubsub.ts` / `pubsub.pure.ts` — PubSub telepresence (multibase topic encoding, presence, signals)
 - `src/sync.ts` — sync orchestration
 
 `ad4m:host` imports confined to 4 adapter files + `index.ts`.
