@@ -6,20 +6,20 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { Transport, TransportResponse } from "../src/transport.js";
-import { initTransport } from "../src/transport.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
-import type { SigningAdapter } from "../src/signing-interface.js";
-import { initSigning } from "../src/signing-interface.js";
+import type { StorageAdapter } from "../src/adapters.js";
+import { initStorage } from "../src/adapters.js";
+import type { Transport, TransportResponse } from "../src/adapters.js";
+import { initTransport } from "../src/adapters.js";
+import type { RuntimeAdapter } from "../src/adapters.js";
+import { initRuntime } from "../src/adapters.js";
+import type { SigningAdapter } from "../src/adapters.js";
+import { initSigning } from "../src/adapters.js";
 import * as store from "../src/store.js";
 import { syncFromIPNS, syncFromCID, fullSync } from "../src/sync.js";
 import { getHeadCid, setHeadCid } from "../src/perspective-dag.js";
-import { buildCommitNode, buildGenesisCommit } from "../src/perspective-dag.pure.js";
-import { linkToNode } from "../src/translate.pure.js";
-import { dagJsonEncode } from "../src/ipld.pure.js";
+import { buildCommitNode, buildGenesisCommit } from "../src/perspective-dag.js";
+import { linkToNode } from "../src/translate.js";
+import { dagJsonEncode } from "../src/ipld.js";
 import type { LinkExpression } from "../src/types.js";
 
 // ---------------------------------------------------------------------------

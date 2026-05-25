@@ -11,8 +11,8 @@
  *   peers/{did}                      → peer metadata JSON
  */
 
-import { getStorage } from "./storage-interface.js";
-import { getRuntime } from "./runtime-interface.js";
+import { getStorage } from "./adapters.js";
+import { getRuntime } from "./adapters.js";
 import type { LinkExpression, PerspectiveDiff, Perspective } from "./types.js";
 
 let _hashFn: ((data: string) => string) | null = null;

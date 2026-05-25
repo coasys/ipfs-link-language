@@ -12,9 +12,9 @@ import {
     isValidCommitNode,
     commitSize,
     chainCommits,
-} from "../src/perspective-dag.pure.js";
-import type { PerspectiveCommitNode } from "../src/perspective-dag.pure.js";
-import type { LinkNode } from "../src/translate.pure.js";
+} from "../src/perspective-dag.js";
+import type { PerspectiveCommitNode } from "../src/perspective-dag.js";
+import type { LinkNode } from "../src/translate.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures

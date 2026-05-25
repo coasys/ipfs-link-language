@@ -5,8 +5,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { detectPattern } from "../src/sdna.js";
-import type { DetectedPattern } from "../src/sdna.js";
+import { detectPattern } from "../src/translate.js";
+import type { DetectedPattern } from "../src/translate.js";
 import type { LinkExpression } from "../src/types.js";
 
 // ---------------------------------------------------------------------------

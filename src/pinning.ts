@@ -8,7 +8,7 @@
  */
 
 import { ipfsPinAdd, ipfsPinRm } from "./ipfs-api.js";
-import { getStorage } from "./storage-interface.js";
+import { getStorage } from "./adapters.js";
 
 // ---------------------------------------------------------------------------
 // Constants

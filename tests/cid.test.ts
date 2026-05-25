@@ -15,7 +15,7 @@ import {
     isCID,
     cidToBase32,
     writeVarint,
-} from "../src/cid.pure.js";
+} from "../src/cid.js";
 
 // ---------------------------------------------------------------------------
 // Base58btc

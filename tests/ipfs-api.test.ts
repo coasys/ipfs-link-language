@@ -23,7 +23,7 @@ import {
     parsePinAddResponse,
     parseKeyGenResponse,
     parseKeyListResponse,
-} from "../src/ipfs-api.pure.js";
+} from "../src/ipfs-api.js";
 
 const API = "http://localhost:5001";
 

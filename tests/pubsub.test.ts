@@ -28,14 +28,14 @@ import {
     peerMapStoragePrefix,
     signalCallbackKey,
     PRESENCE_TTL_MS,
-} from "../src/pubsub.pure.js";
-import type { PresenceRecord, PubSubMessage } from "../src/pubsub.pure.js";
+} from "../src/pubsub.js";
+import type { PresenceRecord, PubSubMessage } from "../src/pubsub.js";
 
 // Impure imports (need adapter setup)
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { Transport, TransportResponse } from "../src/transport.js";
-import { initTransport } from "../src/transport.js";
+import type { StorageAdapter } from "../src/adapters.js";
+import { initStorage } from "../src/adapters.js";
+import type { Transport, TransportResponse } from "../src/adapters.js";
+import { initTransport } from "../src/adapters.js";
 
 import {
     publishPresence,

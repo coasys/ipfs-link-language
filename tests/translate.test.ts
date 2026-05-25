@@ -12,8 +12,8 @@ import {
     isValidLinkNode,
     linksToNodes,
     nodesToLinks,
-} from "../src/translate.pure.js";
-import type { LinkNode } from "../src/translate.pure.js";
+} from "../src/translate.js";
+import type { LinkNode } from "../src/translate.js";
 import type { LinkExpression } from "../src/types.js";
 
 // ---------------------------------------------------------------------------

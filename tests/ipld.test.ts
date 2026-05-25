@@ -11,7 +11,7 @@ import {
     dagLink,
     isDagJsonLink,
     dagJsonContentKey,
-} from "../src/ipld.pure.js";
+} from "../src/ipld.js";
 
 // ---------------------------------------------------------------------------
 // dagJsonEncode / dagJsonDecode

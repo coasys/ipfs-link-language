@@ -12,23 +12,23 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 // Adapter interfaces
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { Transport, TransportResponse } from "../src/transport.js";
-import { initTransport } from "../src/transport.js";
-import type { SigningAdapter } from "../src/signing-interface.js";
-import { initSigning } from "../src/signing-interface.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
+import type { StorageAdapter } from "../src/adapters.js";
+import { initStorage } from "../src/adapters.js";
+import type { Transport, TransportResponse } from "../src/adapters.js";
+import { initTransport } from "../src/adapters.js";
+import type { SigningAdapter } from "../src/adapters.js";
+import { initSigning } from "../src/adapters.js";
+import type { RuntimeAdapter } from "../src/adapters.js";
+import { initRuntime } from "../src/adapters.js";
 
 // Production modules under test
 import * as store from "../src/store.js";
-import { linkToNode, nodeToLink, linkContentKey, linksToNodes, nodesToLinks } from "../src/translate.pure.js";
-import { dagJsonEncode, dagJsonDecode, dagLink, isDagJsonLink } from "../src/ipld.pure.js";
-import { buildCommitNode, buildGenesisCommit, getPreviousCid, isValidCommitNode, commitSize } from "../src/perspective-dag.pure.js";
-import { isDuplicate, linkContentHash, linkOriginKey, shouldPublish, isExcludedPredicate } from "../src/dual-language.js";
-import { detectPattern } from "../src/sdna.js";
-import { buildCIDv1, parseCID, isCID, base58btcEncode, base58btcDecode } from "../src/cid.pure.js";
+import { linkToNode, nodeToLink, linkContentKey, linksToNodes, nodesToLinks } from "../src/translate.js";
+import { dagJsonEncode, dagJsonDecode, dagLink, isDagJsonLink } from "../src/ipld.js";
+import { buildCommitNode, buildGenesisCommit, getPreviousCid, isValidCommitNode, commitSize } from "../src/perspective-dag.js";
+import { isDuplicate, linkContentHash, linkOriginKey, shouldPublish, isExcludedPredicate } from "../src/translate.js";
+import { detectPattern } from "../src/translate.js";
+import { buildCIDv1, parseCID, isCID, base58btcEncode, base58btcDecode } from "../src/cid.js";
 import { recordPin, removePin, isPinned, listPinnedCids } from "../src/pinning.js";
 import { getHeadCid, setHeadCid } from "../src/perspective-dag.js";
 
