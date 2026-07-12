@@ -25,8 +25,16 @@ import type { IPFSSettings } from "./src/settings.js";
 import { shouldPublish, linkOriginKey, linkContentHash, isExcludedPredicate } from "./src/translate.js";
 import type { LinkOrigin } from "./src/translate.js";
 import * as store from "./src/store.js";
-import { createCommit, getHeadCid } from "./src/perspective-dag.js";
-import { syncFromIPNS, fullSync } from "./src/sync.js";
+import {
+    createCommit,
+    getHeadCid,
+    setHeadCid,
+    setPeerHead,
+    setSelfIpnsName,
+    getSelfIpnsName,
+    currentRevisionHash,
+} from "./src/perspective-dag.js";
+import { syncFromPeers } from "./src/sync.js";
 import { ipnsPublish } from "./src/ipfs-api.js";
 import { pinCid } from "./src/pinning.js";
 import {
@@ -36,7 +44,13 @@ import {
     sendBroadcast as pubsubSendBroadcast,
     registerSignalCallback as pubsubRegisterSignalCallback,
     clearSignalCallback,
+    announceHead,
+    storePeerIpnsName,
+    listPeerIpnsNames,
+    handleHeadAnnounce,
+    isHeadAnnounceMessage,
 } from "./src/pubsub.js";
+import type { PubSubMessage, HeadAnnounceMessage } from "./src/pubsub.js";
 
 // Adapter imports
 import { initTransport, initStorage, getStorage, initSigning, initRuntime } from "./src/adapters.js";
@@ -72,6 +86,47 @@ let myDid: string = "";
 let settings: IPFSSettings;
 
 // ---------------------------------------------------------------------------
+// Head publication — publish our own IPNS head + announce it to peers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Publish `cid` as this agent's head: update our own per-agent IPNS name and
+ * announce it on the neighbourhood head topic so peers can discover it.
+ * Best-effort — IPNS publish latency must not block commit/sync.
+ */
+async function republishHead(cid: string): Promise<void> {
+    if (IPNS_NAME !== "<to-be-filled>") {
+        try {
+            await ipnsPublish(IPFS_API_URL, cid, settings.ipns.keyName, settings.ipns.ttlSeconds);
+        } catch (err) {
+            console.log(`[ipfs-link-language] IPNS publish failed: ${err}`);
+        }
+    }
+    if (NEIGHBOURHOOD_URL !== "<to-be-filled>") {
+        const selfName = getSelfIpnsName() || IPNS_NAME;
+        if (selfName && selfName !== "<to-be-filled>") {
+            try {
+                await announceHead(IPFS_API_URL, NEIGHBOURHOOD_URL, myDid, selfName, cid);
+            } catch (err) {
+                console.log(`[ipfs-link-language] head announce failed: ${err}`);
+            }
+        }
+    }
+}
+
+/**
+ * Ingest an incoming head announcement: record the peer's IPNS name and seed
+ * its announced head CID directly into the local head frontier, so the next
+ * `sync()` converges against it even before IPNS resolution catches up.
+ */
+function ingestHeadAnnounce(msg: HeadAnnounceMessage): void {
+    const info = handleHeadAnnounce(msg, myDid);
+    if (info && info.head) {
+        setPeerHead(info.did, info.head);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
 
@@ -92,18 +147,34 @@ const language = defineLanguage({
         myDid = agentDid();
         settings = parseSettings(languageSettings());
 
+        // This agent's OWN per-agent IPNS name (peers resolve this to read our
+        // head). Peers publish their own heads under their own names.
+        if (IPNS_NAME !== "<to-be-filled>") {
+            setSelfIpnsName(IPNS_NAME);
+        }
+
         console.log(`[ipfs-link-language] init: did=${myDid}`);
         console.log(`[ipfs-link-language] IPFS API: ${IPFS_API_URL}`);
-        console.log(`[ipfs-link-language] IPNS name: ${IPNS_NAME}`);
+        console.log(`[ipfs-link-language] self IPNS name: ${IPNS_NAME}`);
         console.log(`[ipfs-link-language] sync mode: ${settings.syncMode}`);
         console.log(`[ipfs-link-language] codec: ${settings.codec}`);
 
-        // If we have an IPNS name and no local head, do a full initial sync
-        if (IPNS_NAME !== "<to-be-filled>" && !getHeadCid()) {
+        // Cold start: if we have no local head yet, seed the frontier from our
+        // own IPNS name (in case a previous instance published one) and any
+        // peer IPNS names we already know, then converge.
+        if (!getHeadCid() && settings.syncMode !== "publish-only") {
             try {
-                const diff = await syncFromIPNS(IPFS_API_URL, IPNS_NAME);
-                if (diff.additions.length > 0 || diff.removals.length > 0) {
-                    console.log(`[ipfs-link-language] initial sync: ${diff.additions.length} additions, ${diff.removals.length} removals`);
+                const peerNames = listPeerIpnsNames();
+                const bootstrap = IPNS_NAME !== "<to-be-filled>" ? [IPNS_NAME, ...peerNames] : peerNames;
+                if (bootstrap.length > 0) {
+                    const diff = await syncFromPeers(IPFS_API_URL, bootstrap, {
+                        mergeAuthor: myDid,
+                        publishHead: (cid) => republishHead(cid),
+                        pin: settings.pinning.pinLocal,
+                    });
+                    if (diff.additions.length > 0 || diff.removals.length > 0) {
+                        console.log(`[ipfs-link-language] initial sync: ${diff.additions.length} additions, ${diff.removals.length} removals`);
+                    }
                 }
             } catch (err) {
                 console.log(`[ipfs-link-language] initial sync failed (may be first peer): ${err}`);
@@ -115,10 +186,6 @@ const language = defineLanguage({
         clearSignalCallback();
         myDid = "";
         console.log("[ipfs-link-language] teardown");
-    },
-
-    interactions() {
-        return [];
     },
 
     // -----------------------------------------------------------------------
@@ -184,17 +251,12 @@ const language = defineLanguage({
                         await pinCid(IPFS_API_URL, commitCid);
                     }
 
-                    // 7. Update IPNS (async — don't block on publish latency)
-                    if (IPNS_NAME !== "<to-be-filled>") {
-                        ipnsPublish(
-                            IPFS_API_URL,
-                            commitCid,
-                            settings.ipns.keyName,
-                            settings.ipns.ttlSeconds,
-                        ).catch(err => {
-                            console.log(`[ipfs-link-language] IPNS publish failed: ${err}`);
-                        });
-                    }
+                    // 7. Publish our new head under our OWN per-agent IPNS name
+                    //    and announce it to peers (async — don't block on IPNS
+                    //    publish latency).
+                    republishHead(commitCid).catch(err => {
+                        console.log(`[ipfs-link-language] head publish failed: ${err}`);
+                    });
 
                     console.log(`[ipfs-link-language] committed: ${commitCid}`);
                 } catch (err) {
@@ -218,11 +280,22 @@ const language = defineLanguage({
                 return { additions: [], removals: [] };
             }
 
-            if (IPNS_NAME === "<to-be-filled>") {
+            // Discover every known peer's head (per-agent IPNS names), plus our
+            // own name as a bootstrap, then converge the frontier via the
+            // multi-parent DAG walk + OR-Set fold. On genuine divergence a
+            // deterministic merge commit is created and republished.
+            const peerNames = listPeerIpnsNames();
+            const names = IPNS_NAME !== "<to-be-filled>" ? [IPNS_NAME, ...peerNames] : peerNames;
+
+            if (names.length === 0) {
                 return { additions: [], removals: [] };
             }
 
-            return await syncFromIPNS(IPFS_API_URL, IPNS_NAME);
+            return await syncFromPeers(IPFS_API_URL, names, {
+                mergeAuthor: myDid,
+                publishHead: (cid) => republishHead(cid),
+                pin: settings.pinning.pinLocal,
+            });
         },
 
         async render() {
@@ -230,7 +303,10 @@ const language = defineLanguage({
         },
 
         async currentRevision() {
-            return store.getRevision() || "";
+            // Content hash of the current head frontier: a single head CID, or
+            // a deterministic digest of the sorted head CIDs (a version-vector
+            // digest). NEVER a cursor/timestamp.
+            return currentRevisionHash();
         },
     },
 
@@ -306,7 +382,15 @@ const language = defineLanguage({
         },
 
         async registerSignalCallback(callback: any): Promise<void> {
-            pubsubRegisterSignalCallback(callback);
+            // Wrap the caller's callback so head announcements are intercepted
+            // (peer IPNS name recorded + head CID seeded into the frontier)
+            // before being passed through.
+            pubsubRegisterSignalCallback((msg: PubSubMessage) => {
+                if (isHeadAnnounceMessage(msg)) {
+                    ingestHeadAnnounce(msg);
+                }
+                callback(msg);
+            });
         },
     },
 });
@@ -321,7 +405,6 @@ export const {
     isPublic,
     init,
     teardown,
-    interactions,
     perspectiveCommit,
     perspectiveSyncSync,
     perspectiveSyncRender,
