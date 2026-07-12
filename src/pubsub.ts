@@ -61,6 +61,15 @@ export function broadcastTopic(neighbourhoodUrl: string): string {
     return `ad4m/${neighbourhoodUrl}/broadcast`;
 }
 
+/**
+ * Build the head-announcement topic for a neighbourhood. Agents announce their
+ * per-agent IPNS name + current head CID here so peers can discover the head
+ * frontier.
+ */
+export function headTopic(neighbourhoodUrl: string): string {
+    return `ad4m/${neighbourhoodUrl}/heads`;
+}
+
 // ---------------------------------------------------------------------------
 // Message payloads
 // ---------------------------------------------------------------------------
@@ -86,7 +95,24 @@ export interface BroadcastMessage {
     timestamp: number;
 }
 
-export type PubSubMessage = PresenceMessage | SignalMessage | BroadcastMessage;
+/**
+ * A head announcement: an agent tells the neighbourhood its own IPNS name and
+ * its current head commit CID, so peers can (a) resolve its IPNS name later
+ * and (b) fast-path directly to the announced head CID.
+ */
+export interface HeadAnnounceMessage {
+    type: "head";
+    did: DID;
+    ipnsName: string;
+    head: string;
+    timestamp: number;
+}
+
+export type PubSubMessage =
+    | PresenceMessage
+    | SignalMessage
+    | BroadcastMessage
+    | HeadAnnounceMessage;
 
 /**
  * Build a presence heartbeat message payload.
@@ -107,6 +133,18 @@ export function buildSignalMessage(fromDid: DID, payload: unknown, timestamp: nu
  */
 export function buildBroadcastMessage(fromDid: DID, payload: unknown, timestamp: number): BroadcastMessage {
     return { type: "broadcast", from: fromDid, payload, timestamp };
+}
+
+/**
+ * Build a head-announcement message payload.
+ */
+export function buildHeadAnnounceMessage(
+    did: DID,
+    ipnsName: string,
+    head: string,
+    timestamp: number,
+): HeadAnnounceMessage {
+    return { type: "head", did, ipnsName, head, timestamp };
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +280,7 @@ export function mergePresenceRecord(
 const PRESENCE_PREFIX = "telepresence/presence/";
 const PEER_MAP_PREFIX = "telepresence/peermap/";
 const SIGNAL_CB_KEY = "telepresence/signal-callback";
+const PEER_IPNS_PREFIX = "sync/peer-ipns/";
 
 /**
  * Storage key for a DID's presence record.
@@ -523,4 +562,90 @@ export function lookupPeerDid(peerId: string): DID | null {
 export function storePresenceRecord(record: PresenceRecord): void {
     const storage = getStorage();
     storage.put(presenceStorageKey(record.did), JSON.stringify(record));
+}
+
+// ---------------------------------------------------------------------------
+// Head announcement (per-agent IPNS head discovery)
+// ---------------------------------------------------------------------------
+
+/**
+ * Storage key for a peer DID → IPNS-name mapping.
+ */
+export function peerIpnsStorageKey(did: DID): string {
+    return `${PEER_IPNS_PREFIX}${did}`;
+}
+
+/**
+ * Prefix for listing all known peer IPNS names.
+ */
+export function peerIpnsStoragePrefix(): string {
+    return PEER_IPNS_PREFIX;
+}
+
+/**
+ * Record a peer's IPNS name (learned from a head announcement).
+ */
+export function storePeerIpnsName(did: DID, ipnsName: string): void {
+    if (!did || !ipnsName) return;
+    getStorage().put(peerIpnsStorageKey(did), ipnsName);
+}
+
+/**
+ * List all known peer IPNS names.
+ */
+export function listPeerIpnsNames(): string[] {
+    const storage = getStorage();
+    const keys = storage.listKeys(peerIpnsStoragePrefix());
+    const out: string[] = [];
+    for (const k of keys) {
+        const name = storage.get(k);
+        if (name) out.push(name);
+    }
+    return out;
+}
+
+/**
+ * Publish this agent's head announcement (its IPNS name + current head CID) to
+ * the neighbourhood head topic.
+ */
+export async function announceHead(
+    apiUrl: string,
+    neighbourhoodUrl: string,
+    did: DID,
+    ipnsName: string,
+    head: string,
+): Promise<void> {
+    const message = buildHeadAnnounceMessage(did, ipnsName, head, Date.now());
+    await publishMessage(apiUrl, headTopic(neighbourhoodUrl), message);
+}
+
+/**
+ * Type guard for a head-announcement message.
+ */
+export function isHeadAnnounceMessage(msg: unknown): msg is HeadAnnounceMessage {
+    if (!msg || typeof msg !== "object") return false;
+    const m = msg as Record<string, unknown>;
+    return (
+        m.type === "head" &&
+        typeof m.did === "string" &&
+        typeof m.ipnsName === "string" &&
+        typeof m.head === "string"
+    );
+}
+
+/**
+ * Handle an incoming head announcement: record the peer's IPNS name so we can
+ * resolve it later. Returns the announced {did, ipnsName, head} so the caller
+ * can seed the head frontier directly with the announced CID.
+ *
+ * The caller's own announcements are ignored (matched by `selfDid`).
+ */
+export function handleHeadAnnounce(
+    msg: HeadAnnounceMessage,
+    selfDid: DID,
+): { did: DID; ipnsName: string; head: string } | null {
+    if (!isHeadAnnounceMessage(msg)) return null;
+    if (msg.did === selfDid) return null;
+    storePeerIpnsName(msg.did, msg.ipnsName);
+    return { did: msg.did, ipnsName: msg.ipnsName, head: msg.head };
 }

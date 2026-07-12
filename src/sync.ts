@@ -1,123 +1,259 @@
 /**
- * Sync via IPNS resolution + DAG traversal.
+ * Sync via per-agent IPNS heads + multi-parent DAG traversal + OR-Set merge.
  *
- * Sync algorithm per Spec §5:
- * 1. Resolve IPNS → latest commit CID
- * 2. Fetch commit node via dag/get
- * 3. Walk `previous` links to find commits since last sync
- * 4. Accumulate additions/removals → PerspectiveDiff
- * 5. Store the resolved CID in KV as sync cursor: `ipfs:sync:head`
+ * This is the AD4M perspective-sync contract for IPFS. IPFS gives us a real
+ * content-addressed commit DAG; the only thing missing from genuine
+ * multi-writer convergence was that a single IPNS name is single-writer
+ * (concurrent publishers clobber each other, last-writer-wins). We fix that:
+ *
+ *  1. Each agent publishes ITS OWN head under ITS OWN IPNS name.
+ *  2. Sync discovers every peer's head (the head frontier) instead of reading
+ *     one shared pointer.
+ *  3. The whole frontier is walked (multi-parent DAG walk), folded via an
+ *     OR-Set keyed by link hash, and applied to the derived local store.
+ *  4. When the frontier has more than one un-merged head, we create a merge
+ *     commit whose parents are all the heads and whose materialised state is
+ *     the OR-Set union — and republish our own IPNS head to point at it.
+ *  5. `currentRevision` is a content hash of the head frontier (single CID, or
+ *     a digest of the sorted head CIDs) — never a cursor/timestamp.
  *
  * No ad4m:host imports — uses injected adapters.
  */
 
-import type { PerspectiveDiff, LinkExpression } from "./types.js";
+import type { PerspectiveDiff } from "./types.js";
 import { ipnsResolve } from "./ipfs-api.js";
 import {
     getHeadCid,
     setHeadCid,
-    walkCommitChain,
+    setPeerHead,
+    currentHeads,
+    walkDag,
+    foldCommits,
     collectDiffFromCommits,
+    createMergeCommit,
+    revisionFromHeads,
 } from "./perspective-dag.js";
 import * as store from "./store.js";
 
 // ---------------------------------------------------------------------------
-// Sync from IPNS
+// Head discovery
 // ---------------------------------------------------------------------------
 
 /**
- * Sync from an IPNS name by resolving it and walking the commit chain.
+ * Resolve a single peer's IPNS name to its head commit CID and record it in
+ * the local head frontier. Returns the resolved CID, or null on failure.
+ */
+export async function discoverPeerHead(
+    apiUrl: string,
+    peerIpnsName: string,
+): Promise<string | null> {
+    let cid: string;
+    try {
+        cid = await ipnsResolve(apiUrl, peerIpnsName);
+    } catch {
+        return null;
+    }
+    if (!cid) return null;
+    setPeerHead(peerIpnsName, cid);
+    return cid;
+}
+
+/**
+ * Resolve many peers' IPNS names, recording each discovered head.
+ * Returns the list of successfully-resolved head CIDs.
+ */
+export async function discoverPeerHeads(
+    apiUrl: string,
+    peerIpnsNames: string[],
+): Promise<string[]> {
+    const heads: string[] = [];
+    for (const name of peerIpnsNames) {
+        const cid = await discoverPeerHead(apiUrl, name);
+        if (cid) heads.push(cid);
+    }
+    return heads;
+}
+
+// ---------------------------------------------------------------------------
+// Converge: walk the frontier, fold, apply, (optionally) merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for {@link converge}.
+ */
+export interface ConvergeOptions {
+    /**
+     * If set (and there is more than one un-merged head), a merge commit is
+     * created authored by this DID, its IPNS head is updated to the merge CID,
+     * and `publishHead` is invoked with the merge CID.
+     */
+    mergeAuthor?: string;
+    /**
+     * Publish this agent's new head after a merge (e.g. IPNS name/publish).
+     * Called only when a merge commit is created.
+     */
+    publishHead?: (cid: string) => Promise<void>;
+    /** Pin merge commits locally. Default true. */
+    pin?: boolean;
+}
+
+/**
+ * The outcome of a convergence pass.
+ */
+export interface ConvergeResult {
+    /** The diff applied to the local store to reach the converged link set. */
+    diff: PerspectiveDiff;
+    /** The head frontier after convergence. */
+    heads: string[];
+    /** The content-hash revision after convergence. */
+    revision: string;
+    /** The merge commit CID, if a merge was created. */
+    mergeCid: string | null;
+}
+
+/**
+ * Converge the local replica against the current head frontier.
  *
- * Returns the PerspectiveDiff of new changes since the last sync.
+ * Walks every head's ancestry (multi-parent), folds via OR-Set, applies the
+ * derived diff to the local store, and — if there is genuine divergence and a
+ * `mergeAuthor` is supplied — creates a deterministic merge commit.
+ */
+export async function converge(
+    apiUrl: string,
+    opts: ConvergeOptions = {},
+): Promise<ConvergeResult> {
+    const heads = currentHeads();
+
+    if (heads.length === 0) {
+        return { diff: { additions: [], removals: [] }, heads, revision: "", mergeCid: null };
+    }
+
+    // Walk the whole frontier's ancestry (deduped across shared history).
+    const withCids = await walkDag(apiUrl, heads);
+    const commits = withCids.map((x) => x.commit);
+
+    // Fold via OR-Set and materialise the derived diff for the local store.
+    const diff = collectDiffFromCommits(commits);
+    store.applyDiff(diff);
+
+    // Divergence: more than one distinct head that isn't already an ancestor
+    // of another. `walkDag` deduped shared history, so if >1 head remain
+    // distinct we have concurrent branches to merge.
+    const distinctHeads = resolveTips(withCids, heads);
+
+    let mergeCid: string | null = null;
+    let finalHeads = distinctHeads;
+
+    if (distinctHeads.length > 1 && opts.mergeAuthor) {
+        mergeCid = await createMergeCommit(apiUrl, distinctHeads, opts.mergeAuthor, opts.pin ?? true);
+        if (opts.publishHead) {
+            await opts.publishHead(mergeCid);
+        }
+        finalHeads = [mergeCid];
+    } else if (distinctHeads.length === 1) {
+        // Single converged head — adopt it as our own head.
+        setHeadCid(distinctHeads[0]);
+    }
+
+    const revision = revisionFromHeads(finalHeads);
+    store.setRevision(revision);
+
+    return { diff, heads: finalHeads, revision, mergeCid };
+}
+
+/**
+ * From a walked DAG, compute the set of TIP CIDs: heads that are not an
+ * ancestor of any other head. If one supplied head is reachable from another,
+ * it is not a tip and is dropped (the reachable-from head subsumes it).
+ */
+function resolveTips(walked: Array<{ cid: string; commit: { previous: Array<{ "/": string }> } }>, heads: string[]): string[] {
+    // Build the set of all CIDs that appear as a parent of some walked node.
+    const isParentOfSomething = new Set<string>();
+    for (const { commit } of walked) {
+        for (const p of commit.previous || []) {
+            if (p && p["/"]) isParentOfSomething.add(p["/"]);
+        }
+    }
+    const tips = [...new Set(heads)].filter((h) => !isParentOfSomething.has(h));
+    return tips.length > 0 ? tips.sort() : [...new Set(heads)].sort();
+}
+
+// ---------------------------------------------------------------------------
+// Sync from a set of peer IPNS names (discover + converge)
+// ---------------------------------------------------------------------------
+
+/**
+ * Full sync entry point: discover the given peers' heads, then converge.
+ *
+ * Returns the diff applied to the local store during convergence.
+ */
+export async function syncFromPeers(
+    apiUrl: string,
+    peerIpnsNames: string[],
+    opts: ConvergeOptions = {},
+): Promise<PerspectiveDiff> {
+    await discoverPeerHeads(apiUrl, peerIpnsNames);
+    const res = await converge(apiUrl, opts);
+    return res.diff;
+}
+
+/**
+ * Sync from a single IPNS name (this agent's own, or a shared bootstrap name).
+ * Records the resolved head into the frontier, then converges.
+ *
+ * Kept for the common single-peer / bootstrap case and for the language's
+ * initial-sync path.
  */
 export async function syncFromIPNS(
     apiUrl: string,
     ipnsName: string,
+    opts: ConvergeOptions = {},
 ): Promise<PerspectiveDiff> {
-    // 1. Resolve IPNS → latest commit CID
-    let latestCid: string;
-    try {
-        latestCid = await ipnsResolve(apiUrl, ipnsName);
-    } catch {
-        // IPNS resolution failed — no changes
-        return { additions: [], removals: [] };
-    }
-
-    if (!latestCid) {
-        return { additions: [], removals: [] };
-    }
-
-    // 2. Check if we're already at the latest
-    const currentHead = getHeadCid();
-    if (currentHead === latestCid) {
-        return { additions: [], removals: [] };
-    }
-
-    // 3. Walk the commit chain from latest back to current head
-    const commits = await walkCommitChain(apiUrl, latestCid, currentHead);
-
-    if (commits.length === 0) {
-        return { additions: [], removals: [] };
-    }
-
-    // 4. Collect all changes into a PerspectiveDiff
-    const diff = collectDiffFromCommits(commits);
-
-    // 5. Apply to local store
-    store.applyDiff(diff);
-
-    // 6. Update head cursor
-    setHeadCid(latestCid);
-    store.setRevision(latestCid);
-
-    return diff;
+    await discoverPeerHead(apiUrl, ipnsName);
+    const res = await converge(apiUrl, opts);
+    return res.diff;
 }
 
+// ---------------------------------------------------------------------------
+// Sync from a known CID directly (bypasses IPNS resolution)
+// ---------------------------------------------------------------------------
+
 /**
- * Sync from a known CID directly (bypasses IPNS resolution).
- * Useful for fast sync when the CID is known from another channel.
+ * Sync from a known head CID directly, recording it as a peer head then
+ * converging. Useful for fast sync when a head CID is known out-of-band
+ * (e.g. via PubSub).
  */
 export async function syncFromCID(
     apiUrl: string,
     targetCid: string,
+    opts: ConvergeOptions = {},
 ): Promise<PerspectiveDiff> {
-    const currentHead = getHeadCid();
-    if (currentHead === targetCid) {
-        return { additions: [], removals: [] };
-    }
-
-    const commits = await walkCommitChain(apiUrl, targetCid, currentHead);
-
-    if (commits.length === 0) {
-        return { additions: [], removals: [] };
-    }
-
-    const diff = collectDiffFromCommits(commits);
-    store.applyDiff(diff);
-    setHeadCid(targetCid);
-    store.setRevision(targetCid);
-
-    return diff;
+    setPeerHead(`cid:${targetCid}`, targetCid);
+    const res = await converge(apiUrl, opts);
+    return res.diff;
 }
 
 /**
- * Full initial sync — walk the entire DAG from root.
- * Used on cold start when there's no local state.
+ * Full initial sync from a single root/head CID on a cold start.
+ * Walks the entire DAG from the head and folds it into the local store.
  */
 export async function fullSync(
     apiUrl: string,
     rootCid: string,
 ): Promise<PerspectiveDiff> {
-    const commits = await walkCommitChain(apiUrl, rootCid, null);
+    const withCids = await walkDag(apiUrl, [rootCid]);
+    const commits = withCids.map((x) => x.commit);
 
     if (commits.length === 0) {
         return { additions: [], removals: [] };
     }
 
-    const diff = collectDiffFromCommits(commits);
+    // On cold start the store is empty, so only live additions matter.
+    const { links } = foldCommits(commits);
+    const diff: PerspectiveDiff = { additions: [...links.values()], removals: [] };
     store.applyDiff(diff);
     setHeadCid(rootCid);
-    store.setRevision(rootCid);
+    store.setRevision(revisionFromHeads([rootCid]));
 
     return diff;
 }
