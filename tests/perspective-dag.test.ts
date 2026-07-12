@@ -8,10 +8,11 @@ import assert from "node:assert/strict";
 import {
     buildCommitNode,
     buildGenesisCommit,
+    buildMergeCommit,
     getPreviousCid,
+    getParentCids,
     isValidCommitNode,
     commitSize,
-    chainCommits,
 } from "../src/perspective-dag.js";
 import type { PerspectiveCommitNode } from "../src/perspective-dag.js";
 import type { LinkNode } from "../src/translate.js";
@@ -47,12 +48,18 @@ describe("buildCommitNode", () => {
         assert.equal(node.timestamp, "2026-05-02T12:00:00.000Z");
         assert.equal(node.additions.length, 2);
         assert.equal(node.removals.length, 1);
-        assert.deepEqual(node.previous, { "/": "bafyPrev" });
+        assert.deepEqual(node.previous, [{ "/": "bafyPrev" }]);
     });
 
-    it("creates genesis commit with null previous", () => {
+    it("creates genesis commit with empty parent array", () => {
         const node = buildCommitNode("did:key:z6MkTest", [makeLinkNode()], [], null);
-        assert.equal(node.previous, null);
+        assert.deepEqual(node.previous, []);
+    });
+
+    it("accepts an array of parent CIDs (merge commit)", () => {
+        const node = buildCommitNode("did:key:z6MkTest", [], [], ["bafyA", "bafyB"]);
+        assert.deepEqual(node.previous, [{ "/": "bafyA" }, { "/": "bafyB" }]);
+        assert.deepEqual(getParentCids(node), ["bafyA", "bafyB"]);
     });
 
     it("auto-generates timestamp if not provided", () => {
@@ -73,9 +80,9 @@ describe("buildCommitNode", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildGenesisCommit", () => {
-    it("creates a commit with null previous", () => {
+    it("creates a commit with an empty parent array", () => {
         const node = buildGenesisCommit("did:key:z6MkTest", [makeLinkNode()]);
-        assert.equal(node.previous, null);
+        assert.deepEqual(node.previous, []);
         assert.equal(node.removals.length, 0);
     });
 
@@ -181,53 +188,31 @@ describe("commitSize", () => {
 });
 
 // ---------------------------------------------------------------------------
-// chainCommits
+// buildMergeCommit
 // ---------------------------------------------------------------------------
 
-describe("chainCommits", () => {
-    it("chains commits with previous links", () => {
-        const commits = [
-            { author: "did:a", additions: [makeLinkNode(1)], removals: [] },
-            { author: "did:b", additions: [makeLinkNode(2)], removals: [] },
-            { author: "did:c", additions: [makeLinkNode(3)], removals: [] },
-        ];
-
-        const result = chainCommits(commits, null, (i) => `cid-${i}`);
-
-        assert.equal(result.length, 3);
-        assert.equal(result[0].previous, null); // genesis
-        assert.deepEqual(result[1].previous, { "/": "cid-0" });
-        assert.deepEqual(result[2].previous, { "/": "cid-1" });
+describe("buildMergeCommit", () => {
+    it("creates a commit with all heads as parents", () => {
+        const node = buildMergeCommit("did:key:z6MkMerge", ["bafyA", "bafyB"]);
+        assert.equal(node.type, "ad4m:PerspectiveCommit");
+        assert.deepEqual(getParentCids(node), ["bafyA", "bafyB"]);
     });
 
-    it("starts from a given CID", () => {
-        const commits = [
-            { author: "did:a", additions: [makeLinkNode(1)], removals: [] },
-        ];
-
-        const result = chainCommits(commits, "bafyExisting", (i) => `cid-${i}`);
-        assert.deepEqual(result[0].previous, { "/": "bafyExisting" });
+    it("sorts parents so the merge is order-independent", () => {
+        const a = buildMergeCommit("did:x", ["bafyB", "bafyA"]);
+        const b = buildMergeCommit("did:x", ["bafyA", "bafyB"]);
+        assert.deepEqual(getParentCids(a), getParentCids(b));
+        assert.deepEqual(getParentCids(a), ["bafyA", "bafyB"]);
     });
 
-    it("handles empty commit list", () => {
-        const result = chainCommits([], null, (i) => `cid-${i}`);
-        assert.deepEqual(result, []);
+    it("dedupes duplicate parent CIDs", () => {
+        const node = buildMergeCommit("did:x", ["bafyA", "bafyA", "bafyB"]);
+        assert.deepEqual(getParentCids(node), ["bafyA", "bafyB"]);
     });
 
-    it("preserves commit metadata", () => {
-        const commits = [
-            {
-                author: "did:key:z6MkSpecific",
-                additions: [makeLinkNode(1)],
-                removals: [makeLinkNode(2)],
-                timestamp: "2026-05-02T15:00:00.000Z",
-            },
-        ];
-
-        const result = chainCommits(commits, null, (i) => `cid-${i}`);
-        assert.equal(result[0].author, "did:key:z6MkSpecific");
-        assert.equal(result[0].timestamp, "2026-05-02T15:00:00.000Z");
-        assert.equal(result[0].additions.length, 1);
-        assert.equal(result[0].removals.length, 1);
+    it("carries no link diffs by default", () => {
+        const node = buildMergeCommit("did:x", ["bafyA", "bafyB"]);
+        assert.equal(node.additions.length, 0);
+        assert.equal(node.removals.length, 0);
     });
 });

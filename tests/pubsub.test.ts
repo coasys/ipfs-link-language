@@ -49,7 +49,15 @@ import {
     storePeerMapping,
     lookupPeerDid,
     storePresenceRecord,
+    headTopic,
+    buildHeadAnnounceMessage,
+    announceHead,
+    isHeadAnnounceMessage,
+    handleHeadAnnounce,
+    storePeerIpnsName,
+    listPeerIpnsNames,
 } from "../src/pubsub.js";
+import type { HeadAnnounceMessage } from "../src/pubsub.js";
 
 // ---------------------------------------------------------------------------
 // Mock Adapters
@@ -751,5 +759,73 @@ describe("topic encoding integration", () => {
         const url = pubsubPubUrl(API, encoded);
         assert.ok(url.includes(encoded));
         assert.ok(url.includes("/api/v0/pubsub/pub?arg="));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Head announcement — per-agent IPNS head discovery
+// ---------------------------------------------------------------------------
+
+describe("head announcement", () => {
+    let mockStorage: MockStorageAdapter;
+    let mockTransport: MockTransport;
+
+    beforeEach(() => {
+        mockStorage = new MockStorageAdapter();
+        mockTransport = new MockTransport();
+        initStorage(mockStorage);
+        initTransport(mockTransport);
+    });
+
+    it("builds a head-announce message with did, ipnsName and head", () => {
+        const msg = buildHeadAnnounceMessage(AGENT_DID, "k51self", "bafyHead", 123);
+        assert.equal(msg.type, "head");
+        assert.equal(msg.did, AGENT_DID);
+        assert.equal(msg.ipnsName, "k51self");
+        assert.equal(msg.head, "bafyHead");
+        assert.equal(msg.timestamp, 123);
+    });
+
+    it("isHeadAnnounceMessage guards correctly", () => {
+        assert.equal(isHeadAnnounceMessage(buildHeadAnnounceMessage(AGENT_DID, "k", "h", 1)), true);
+        assert.equal(isHeadAnnounceMessage(buildSignalMessage(AGENT_DID, {}, 1)), false);
+        assert.equal(isHeadAnnounceMessage(null), false);
+        assert.equal(isHeadAnnounceMessage({ type: "head" }), false);
+    });
+
+    it("publishes to the head topic via transport", async () => {
+        mockTransport.addResponse("/api/v0/pubsub/pub", { status: 200, headers: {}, body: "{}" });
+        await announceHead(API, NH_URL, AGENT_DID, "k51self", "bafyHead");
+
+        const req = mockTransport.requests.find(r => r.url.includes("/pubsub/pub"));
+        assert.ok(req, "expected a pubsub/pub request");
+        // The topic is the multibase-encoded head topic.
+        assert.ok(req!.url.includes(encodeTopicMultibase(headTopic(NH_URL))));
+        assert.ok(req!.body.includes('"type":"head"'));
+    });
+
+    it("records and lists peer IPNS names", () => {
+        storePeerIpnsName(REMOTE_DID, "k51remote");
+        storePeerIpnsName(AGENT_DID, "k51self");
+        const names = listPeerIpnsNames().sort();
+        assert.deepEqual(names, ["k51remote", "k51self"]);
+    });
+
+    it("handleHeadAnnounce records the peer's IPNS name and returns the head", () => {
+        const msg = buildHeadAnnounceMessage(REMOTE_DID, "k51remote", "bafyPeerHead", Date.now());
+        const info = handleHeadAnnounce(msg, AGENT_DID);
+        assert.ok(info);
+        assert.equal(info!.did, REMOTE_DID);
+        assert.equal(info!.ipnsName, "k51remote");
+        assert.equal(info!.head, "bafyPeerHead");
+        // The IPNS name is now discoverable for later resolution.
+        assert.deepEqual(listPeerIpnsNames(), ["k51remote"]);
+    });
+
+    it("handleHeadAnnounce ignores our own announcements", () => {
+        const msg = buildHeadAnnounceMessage(AGENT_DID, "k51self", "bafySelf", Date.now());
+        const info = handleHeadAnnounce(msg, AGENT_DID);
+        assert.equal(info, null);
+        assert.deepEqual(listPeerIpnsNames(), []);
     });
 });

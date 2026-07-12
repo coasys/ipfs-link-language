@@ -273,15 +273,15 @@ describe("Cross-runtime: Translation round-trip", () => {
 describe("Cross-runtime: Commit node chain", () => {
     beforeEach(() => initAllAdapters());
 
-    it("genesis commit has null previous", () => {
+    it("genesis commit has an empty parent array", () => {
         const node = buildGenesisCommit("did:key:z6MkTest", [linkToNode(makeLinkExpression())]);
-        assert.equal(node.previous, null);
+        assert.deepEqual(node.previous, []);
         assert.equal(isValidCommitNode(node), true);
     });
 
     it("subsequent commit links to previous", () => {
         const node = buildCommitNode("did:key:z6MkTest", [], [], "bafyPrev");
-        assert.deepEqual(node.previous, { "/": "bafyPrev" });
+        assert.deepEqual(node.previous, [{ "/": "bafyPrev" }]);
         assert.equal(getPreviousCid(node), "bafyPrev");
     });
 
@@ -370,7 +370,7 @@ describe("Cross-runtime: Full pipeline", () => {
         // 3. Build a commit
         const commit = buildGenesisCommit("did:key:z6MkTest", nodes, "2026-05-02T12:00:00.000Z");
         assert.equal(commit.additions.length, 2);
-        assert.equal(commit.previous, null);
+        assert.deepEqual(commit.previous, []);
 
         // 4. DAG-JSON encode the commit
         const encoded = dagJsonEncode(commit);
