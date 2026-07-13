@@ -25,6 +25,7 @@ import type { LinkNode } from "./translate.js";
 import type { DagJsonLink } from "./ipld.js";
 import { ipfsDagPut, ipfsDagGet } from "./ipfs-api.js";
 import { getStorage, getRuntime } from "./adapters.js";
+import { getCachedCommit } from "./sidecar.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -430,12 +431,24 @@ export async function createMergeCommit(
 }
 
 /**
- * Fetch a commit node from IPFS by CID.
+ * Fetch a commit node by CID.
+ *
+ * A locally-cached body wins before any network call. This is what lets the
+ * multi-parent DAG walk fold a PEER's history cross-node: on Kubo 0.42.0 two
+ * directly-peered nodes never negotiate `/ipfs/bitswap`, so `dag/get` of a
+ * peer's CID cannot transfer the block. Instead peers publish each commit body
+ * INLINE over pubsub (see sidecar.ts); the receive path caches it under its
+ * CID, and the walk resolves it from cache. Own commits, and any block the
+ * local node already holds, still resolve via `ipfsDagGet`.
  */
 export async function fetchCommit(
     apiUrl: string,
     cid: string,
 ): Promise<PerspectiveCommitNode> {
+    const cached = getCachedCommit(cid);
+    if (cached && isValidCommitNode(cached)) {
+        return cached;
+    }
     const data = await ipfsDagGet<PerspectiveCommitNode>(apiUrl, cid);
     if (!isValidCommitNode(data)) {
         throw new Error(`Invalid commit node at CID ${cid}`);

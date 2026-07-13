@@ -33,7 +33,9 @@ import {
     setSelfIpnsName,
     getSelfIpnsName,
     currentRevisionHash,
+    fetchCommit,
 } from "./src/perspective-dag.js";
+import type { PerspectiveCommitNode } from "./src/perspective-dag.js";
 import { syncFromPeers } from "./src/sync.js";
 import { ipnsPublish } from "./src/ipfs-api.js";
 import { pinCid } from "./src/pinning.js";
@@ -51,10 +53,19 @@ import {
     isHeadAnnounceMessage,
 } from "./src/pubsub.js";
 import type { PubSubMessage, HeadAnnounceMessage } from "./src/pubsub.js";
+import {
+    initSidecar,
+    sidecarEnabled,
+    diffTopic,
+    publishInlineCommit,
+    pollTopic,
+    cacheCommit,
+    isInlineCommitMessage,
+} from "./src/sidecar.js";
 
 // Adapter imports
 import { initTransport, initStorage, getStorage, initSigning, initRuntime } from "./src/adapters.js";
-import { DenoTransport, DenoStorageAdapter, DenoSigningAdapter, DenoRuntime } from "./src/adapters-deno.js";
+import { DenoTransport, SidecarTransport, DenoStorageAdapter, DenoSigningAdapter, DenoRuntime } from "./src/adapters-deno.js";
 
 // ---------------------------------------------------------------------------
 // Template Variables (per Spec §8)
@@ -77,6 +88,9 @@ const NEIGHBOURHOOD_META = "<to-be-filled>";
 
 //!@ad4m-template-variable
 const NEIGHBOURHOOD_URL = "<to-be-filled>";
+
+//!@ad4m-template-variable
+const SIDECAR_URL = "<to-be-filled>";
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -126,6 +140,107 @@ function ingestHeadAnnounce(msg: HeadAnnounceMessage): void {
     }
 }
 
+/**
+ * Read a commit node body by CID (cache-first, then the local Kubo node). Used
+ * on commit to obtain the just-written body for inline broadcast; the block is
+ * always present locally so this never needs the network.
+ */
+async function fetchCommitBody(cid: string): Promise<PerspectiveCommitNode | null> {
+    try {
+        return await fetchCommit(IPFS_API_URL, cid);
+    } catch (err) {
+        console.log(`[ipfs-link-language] could not read own commit ${cid}: ${err}`);
+        return null;
+    }
+}
+
+/**
+ * Broadcast a newly-created MERGE commit body inline over the neighbourhood
+ * diff topic, exactly as {@link commit} does for a normal commit. A merge
+ * commit carries no new link diffs (its materialised state is the OR-Set fold
+ * of its ancestors), but a PEER that later builds on this merge must be able to
+ * resolve it: on Kubo 0.42.0 a cross-node `dag/get` of the merge block cannot
+ * succeed, so without this inline broadcast the peer's walk blocks on the
+ * bitswap timeout and never folds the child. Best-effort; failures are logged.
+ */
+async function publishMergeInline(mergeCid: string): Promise<void> {
+    if (!sidecarEnabled() || NEIGHBOURHOOD_URL === "<to-be-filled>") return;
+    try {
+        const node = await fetchCommitBody(mergeCid);
+        if (node) {
+            cacheCommit(mergeCid, node);
+            await publishInlineCommit(NEIGHBOURHOOD_URL, mergeCid, node);
+        }
+    } catch (err) {
+        console.log(`[ipfs-link-language] inline merge publish failed: ${err}`);
+    }
+}
+
+/**
+ * Poll the sidecar's diff topic and ingest every peer inline-commit: cache the
+ * body under its CID (so the DAG walk resolves it without bitswap) and seed the
+ * CID into the head frontier (so the next converge folds it). Returns the count
+ * ingested. Our own echoed commits are skipped.
+ */
+async function ingestInlineDiffs(): Promise<number> {
+    if (!sidecarEnabled() || NEIGHBOURHOOD_URL === "<to-be-filled>") return 0;
+    let ingested = 0;
+    let payloads: string[];
+    try {
+        payloads = await pollTopic(diffTopic(NEIGHBOURHOOD_URL));
+    } catch (err) {
+        console.log(`[ipfs-link-language] diff poll failed: ${err}`);
+        return 0;
+    }
+    for (const raw of payloads) {
+        let msg: unknown;
+        try {
+            msg = JSON.parse(raw);
+        } catch {
+            continue;
+        }
+        if (!isInlineCommitMessage(msg)) continue;
+        if (msg.did === myDid) continue; // skip our own echo
+        cacheCommit(msg.cid, msg.commit);
+        // Key the peer head by DID so a later commit from the same peer replaces
+        // (not accumulates) its frontier entry — currentHeads folds to tips.
+        setPeerHead(msg.did, msg.cid);
+        ingested += 1;
+    }
+    return ingested;
+}
+
+/**
+ * Snapshot the local link set as a map of link content hash → LinkExpression.
+ * Used to compute the exact delta a convergence pass applied.
+ */
+function snapshotLinkSet(): Map<string, LinkExpression> {
+    const map = new Map<string, LinkExpression>();
+    for (const link of store.allLinks().links) {
+        map.set(store.hashLink(link), link);
+    }
+    return map;
+}
+
+/**
+ * Diff two link-set snapshots into a PerspectiveDiff: links present only in
+ * `after` are additions; links present only in `before` are removals.
+ */
+function diffLinkSets(
+    before: Map<string, LinkExpression>,
+    after: Map<string, LinkExpression>,
+): PerspectiveDiff {
+    const additions: LinkExpression[] = [];
+    const removals: LinkExpression[] = [];
+    for (const [h, link] of after) {
+        if (!before.has(h)) additions.push(link);
+    }
+    for (const [h, link] of before) {
+        if (!after.has(h)) removals.push(link);
+    }
+    return { additions, removals };
+}
+
 // ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
@@ -137,15 +252,39 @@ const language = defineLanguage({
     isPublic: true,
 
     async init() {
-        // Initialize adapters before anything else
+        // Initialize adapters before anything else. The DID is needed up front
+        // so the sidecar transport can stamp it on every Kubo call (that header
+        // is how the sidecar routes each agent to its OWN Kubo node).
         initRuntime(new DenoRuntime());
         initStorage(new DenoStorageAdapter());
-        initTransport(new DenoTransport());
         initSigning(new DenoSigningAdapter());
         store.initStore();
 
         myDid = agentDid();
         settings = parseSettings(languageSettings());
+
+        // Transport selection: with SIDECAR_URL set, route Kubo calls through
+        // the pubsub-bridge sidecar (genuine separate nodes + inline-diff
+        // pubsub transport that sidesteps cross-node bitswap). Otherwise talk to
+        // the Kubo HTTP API directly (single-node / unit-test mode).
+        if (SIDECAR_URL !== "<to-be-filled>") {
+            initTransport(new SidecarTransport(SIDECAR_URL, IPFS_API_URL, myDid));
+            initSidecar(SIDECAR_URL, myDid);
+            console.log(`[ipfs-link-language] sidecar mode: ${SIDECAR_URL}`);
+            // Eagerly open the diff-topic subscription on the sidecar so no
+            // inline commit is missed between join and the first sync (gossipsub
+            // only delivers to CURRENT subscribers). A single poll starts the
+            // sidecar's long-lived pubsub/sub for this topic.
+            if (NEIGHBOURHOOD_URL !== "<to-be-filled>") {
+                try {
+                    await pollTopic(diffTopic(NEIGHBOURHOOD_URL));
+                } catch (err) {
+                    console.log(`[ipfs-link-language] initial diff subscribe failed: ${err}`);
+                }
+            }
+        } else {
+            initTransport(new DenoTransport());
+        }
 
         // This agent's OWN per-agent IPNS name (peers resolve this to read our
         // head). Peers publish their own heads under their own names.
@@ -251,7 +390,26 @@ const language = defineLanguage({
                         await pinCid(IPFS_API_URL, commitCid);
                     }
 
-                    // 7. Publish our new head under our OWN per-agent IPNS name
+                    // 7. Broadcast the commit body INLINE over the neighbourhood
+                    //    diff topic. On Kubo 0.42.0 two directly-peered nodes
+                    //    never negotiate bitswap, so a peer cannot fetch this
+                    //    commit's BLOCK cross-node; shipping the full body over
+                    //    pubsub lets peers fold it via the existing OR-Set DAG
+                    //    walk (fetchCommit reads it from their inline cache). The
+                    //    block still lives locally, so OUR head CID is real.
+                    if (sidecarEnabled() && NEIGHBOURHOOD_URL !== "<to-be-filled>") {
+                        try {
+                            const node = await fetchCommitBody(commitCid);
+                            if (node) {
+                                cacheCommit(commitCid, node);
+                                await publishInlineCommit(NEIGHBOURHOOD_URL, commitCid, node);
+                            }
+                        } catch (err) {
+                            console.log(`[ipfs-link-language] inline commit publish failed: ${err}`);
+                        }
+                    }
+
+                    // 8. Publish our new head under our OWN per-agent IPNS name
                     //    and announce it to peers (async — don't block on IPNS
                     //    publish latency).
                     republishHead(commitCid).catch(err => {
@@ -280,22 +438,41 @@ const language = defineLanguage({
                 return { additions: [], removals: [] };
             }
 
-            // Discover every known peer's head (per-agent IPNS names), plus our
-            // own name as a bootstrap, then converge the frontier via the
-            // multi-parent DAG walk + OR-Set fold. On genuine divergence a
-            // deterministic merge commit is created and republished.
+            // 1. Drain the sidecar's diff topic first: cache every peer's inline
+            //    commit body and seed its CID into the frontier. This is the
+            //    cross-node transport — without it, a peer's head CID would be
+            //    unresolvable (bitswap can't move the block) and convergence
+            //    would stall.
+            await ingestInlineDiffs();
+
+            // 2. Snapshot the local link set so we can emit exactly the delta
+            //    that convergence applies. (The executor DISCARDS sync()'s
+            //    return value — inbound folds only become queryable via
+            //    emitPerspectiveDiff. Not emitting here is the classic
+            //    "committed but never converged" failure.)
+            const before = snapshotLinkSet();
+
+            // 3. Discover any IPNS-published peer heads too (belt and braces
+            //    for the direct-Kubo path), then converge the whole frontier via
+            //    the multi-parent DAG walk + OR-Set fold. On genuine divergence
+            //    a deterministic merge commit is created and republished.
             const peerNames = listPeerIpnsNames();
             const names = IPNS_NAME !== "<to-be-filled>" ? [IPNS_NAME, ...peerNames] : peerNames;
 
-            if (names.length === 0) {
-                return { additions: [], removals: [] };
-            }
-
-            return await syncFromPeers(IPFS_API_URL, names, {
+            await syncFromPeers(IPFS_API_URL, names, {
                 mergeAuthor: myDid,
                 publishHead: (cid) => republishHead(cid),
+                publishMerge: (cid) => publishMergeInline(cid),
                 pin: settings.pinning.pinLocal,
             });
+
+            // 4. Emit the delta the fold actually applied to the local store, so
+            //    the host surfaces the newly-converged links to subscribers.
+            const delta = diffLinkSets(before, snapshotLinkSet());
+            if (delta.additions.length > 0 || delta.removals.length > 0) {
+                emitPerspectiveDiff(delta);
+            }
+            return delta;
         },
 
         async render() {

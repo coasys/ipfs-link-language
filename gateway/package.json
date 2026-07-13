@@ -1,0 +1,12 @@
+{
+  "name": "@hexafield/ipfs-gateway",
+  "version": "0.1.0",
+  "description": "Node.js pubsub-bridge sidecar for the IPFS AD4M Link Language — owns long-lived IPFS pubsub subscriptions and routes each agent to its own Kubo node",
+  "type": "module",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/*.test.js"
+  }
+}

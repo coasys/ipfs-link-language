@@ -82,11 +82,49 @@ unit-tested in-process against a content-addressed mock of the IPFS API surface
 `tests/convergence.test.ts` for the perspective-sync acceptance criteria and
 `tests/sync.test.ts` for frontier convergence and merge-commit creation.
 
-> **Live-node note:** cross-agent convergence over *real* IPFS/IPNS (peers publishing
-> to their own IPNS keys, PubSub head announcements propagating, name resolution)
-> requires a running Kubo daemon and is not exercised by the unit suite. The
-> convergence *logic* is fully covered against the IPFS API surface; wiring against a
-> live daemon is an integration concern.
+> **Live-node verification:** cross-agent convergence over *real* IPFS has been run
+> end-to-end across **two genuinely separate Kubo nodes** (node A `:5001`, node B
+> `:5002`, swarm-peered, distinct blockstores) behind the pubsub-bridge sidecar
+> (see below). Via AD4M's C1 convergence scenario (`ad4m-wind-tunnel`), both agents
+> reached **20/20 links in ~4.0 s** and a removal converged in **~6.1 s**
+> (reproduced across consecutive runs). The convergence *logic* is unit-tested
+> against the IPFS API surface; the live run additionally validated the transport
+> path and surfaced four transport-only defects (see the sidecar section and
+> `AGENTS.md`).
+
+## Cross-node transport: the pubsub-bridge sidecar
+
+On Kubo 0.42.0, two directly-peered nodes **never negotiate a bitswap block
+transfer**, so a peer's commit *block* is unfetchable cross-node (`dag/get` for a
+peer-only CID hangs on the daemon's ~30–50 s internal timeout). Genuine multi-node
+convergence therefore cannot rely on block exchange. Two pieces bridge the gap:
+
+- **`gateway/` — a Node.js pubsub-bridge sidecar.** The executor's `httpFetch`
+  buffers and UTF-8-decodes a whole response body, so it can *publish* to a pubsub
+  topic but can never hold Kubo's long-lived streaming `pubsub/sub` receive stream.
+  The sidecar (Node, `npm start` on `:7793`) holds that stream, exposes a pollable
+  `GET /messages?topic&since` buffer, and forwards the unary Kubo ops
+  (`dag/put`, `dag/get`, `name/publish`, `pin/add`, …) verbatim. It routes each
+  request to the DID's own Kubo node by the `X-Ad4m-Did` header, so one templated
+  bundle can drive two separate nodes. Authored in `.js` (no build step); its
+  files ARE the source. Tests: `cd gateway && npm test` (7 tests).
+- **Inline-diff transport (`src/sidecar.ts`).** Every commit's **full body** is
+  published inline over a per-neighbourhood diff topic; peers cache it by CID and
+  the DAG walk folds across it from cache instead of attempting the (doomed)
+  cross-node `dag/get`. Blocks are still written locally, so each node's own head
+  CID is real and content-addressed — only *cross-node* fetch is replaced.
+
+**Merge commits must ALSO be published inline.** A merge commit (created by
+`converge()` on divergence) carries no *new* diff, but it **is** an ancestor of the
+next commit — so a peer whose later commit's parent is that merge would force an
+unfetchable cross-node `dag/get`. `converge()` therefore takes a `publishMerge`
+callback and inline-publishes the merge body **before** advancing IPNS.
+
+> **Sandbox gotcha (load-bearing):** the language runs in a Deno sandbox with
+> `allow_env:none`. A *keyed* `process.env.X` read routes through `Deno.env.get`,
+> throws `NotCapable`, and aborts evaluation of the **entire** bundle. Never read
+> env at runtime inside the language — gate debug behaviour on compile-time
+> constants only.
 
 ## Architecture
 
@@ -101,7 +139,11 @@ imported by `index.ts`.
   head/frontier management, per-agent IPNS bookkeeping, DAG walk, OR-Set fold,
   merge-commit construction, content-hash revision
 - `src/sync.ts` — frontier-based convergence: peer-head discovery, walk → fold →
-  apply, tip resolution, merge-on-divergence
+  apply, tip resolution, merge-on-divergence, `publishMerge` inline-merge hook
+- `src/sidecar.ts` — sidecar transport: multibase topic encoding, pollable
+  `/messages` receive with status-0 retry, inline-commit publish/cache
+- `gateway/src/{server,routes,kubo,state}.js` — the Node pubsub-bridge sidecar
+  (receive stream, `/messages` buffer, per-DID Kubo routing, unary passthrough)
 - `src/pubsub.ts` — PubSub telepresence + head-announcement topic (presence,
   signals, `{ did, ipnsName, head }` announcements, multibase topic encoding)
 - `src/store.ts` — indexed local link store (source, target, predicate) + revision

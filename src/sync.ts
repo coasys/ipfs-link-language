@@ -93,6 +93,15 @@ export interface ConvergeOptions {
      * Called only when a merge commit is created.
      */
     publishHead?: (cid: string) => Promise<void>;
+    /**
+     * Broadcast a newly-created MERGE commit body inline (over the pubsub diff
+     * topic), so peers can fold across it from their local cache. Without this,
+     * a peer's later commit whose parent is this merge forces a cross-node
+     * `dag/get` that can never succeed on Kubo 0.42.0 (bitswap does not transfer
+     * blocks between directly-peered nodes) and blocks the walk on its timeout.
+     * Called only when a merge commit is created, with the merge CID.
+     */
+    publishMerge?: (cid: string) => Promise<void>;
     /** Pin merge commits locally. Default true. */
     pin?: boolean;
 }
@@ -146,6 +155,12 @@ export async function converge(
 
     if (distinctHeads.length > 1 && opts.mergeAuthor) {
         mergeCid = await createMergeCommit(apiUrl, distinctHeads, opts.mergeAuthor, opts.pin ?? true);
+        // Broadcast the merge body inline BEFORE advancing IPNS, so a peer that
+        // later builds on this merge can fold across it from cache rather than
+        // blocking on a cross-node block fetch that cannot complete.
+        if (opts.publishMerge) {
+            await opts.publishMerge(mergeCid);
+        }
         if (opts.publishHead) {
             await opts.publishHead(mergeCid);
         }
